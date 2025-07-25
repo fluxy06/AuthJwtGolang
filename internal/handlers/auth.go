@@ -24,7 +24,7 @@ func NewHandler(db *sql.DB) *Handler {
 	return &Handler{
 		userRepo:         &storage.UserRepository{DB: db},
 		refreshTokenRepo: &storage.RefreshTokenRepository{DB: db},
-		JwtSecret:        []byte("your-very-secret-key"), // лучше брать из env
+		JwtSecret:        []byte("your-very-secret-key"), // Лучше вынести в ENV
 	}
 }
 
@@ -66,22 +66,9 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-type refreshRequest struct {
-	RefreshToken string `json:"refresh_token"`
-}
-
-type refreshResponse struct {
-	RefreshToken string `json:"refresh_token"`
-}
-
 type loginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
-}
-
-type loginResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -127,89 +114,31 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Устанавливаем access token в httpOnly cookie
+	// Устанавливаем access_token и refresh_token в куки
 	http.SetCookie(w, &http.Cookie{
 		Name:     "access_token",
 		Value:    accessToken,
 		HttpOnly: true,
-		Secure:   false, // Поставь true, если HTTPS
+		Secure:   false, // true для HTTPS
 		Path:     "/",
 		Expires:  time.Now().Add(15 * time.Minute),
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	// Отдаем refresh токен в JSON
-	resp := loginResponse{
-		RefreshToken: refreshTokenStr,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req refreshRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
-	}
-
-	rt, err := h.refreshTokenRepo.Find(req.RefreshToken)
-	if err != nil {
-		http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
-		return
-	}
-
-	if rt.ExpiresAt.Before(time.Now()) {
-		http.Error(w, "Refresh token expired", http.StatusUnauthorized)
-		return
-	}
-
-	// Новый access token
-	accessToken, err := h.createJWT(rt.UserID, 15*time.Minute)
-	if err != nil {
-		http.Error(w, "Failed to create access token", http.StatusInternalServerError)
-		return
-	}
-
-	// Новый refresh token
-	newRefreshToken := generateRandomToken()
-	newExpiresAt := time.Now().Add(7 * 24 * time.Hour)
-
-	err = h.refreshTokenRepo.Update(req.RefreshToken, newRefreshToken, newExpiresAt.Format(time.RFC3339))
-	if err != nil {
-		http.Error(w, "Failed to update refresh token", http.StatusInternalServerError)
-		return
-	}
-
-	// Устанавливаем новый access token в cookie
 	http.SetCookie(w, &http.Cookie{
-		Name:     "access_token",
-		Value:    accessToken,
+		Name:     "refresh_token",
+		Value:    refreshTokenStr,
 		HttpOnly: true,
-		Secure:   false, // поменяй на true при HTTPS
+		Secure:   false, // true для HTTPS
 		Path:     "/",
-		Expires:  time.Now().Add(15 * time.Minute),
+		Expires:  time.Now().Add(7 * 24 * time.Hour),
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	// Отдаем новый refresh token в JSON
-	resp := refreshResponse{
-		RefreshToken: newRefreshToken,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	w.WriteHeader(http.StatusOK)
 }
 
-type logoutRequest struct {
-	RefreshToken string `json:"refresh_token"`
-}
+type logoutRequest struct{}
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -217,20 +146,28 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req logoutRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
+	refreshCookie, err := r.Cookie("refresh_token")
+	if err == nil {
+		_ = h.refreshTokenRepo.Delete(refreshCookie.Value)
 	}
 
-	err := h.refreshTokenRepo.Delete(req.RefreshToken)
-	if err != nil {
-		http.Error(w, "Failed to logout", http.StatusInternalServerError)
-		return
-	}
+	// Удаляем куки
+	clearCookie(w, "access_token")
+	clearCookie(w, "refresh_token")
 
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func clearCookie(w http.ResponseWriter, name string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:    name,
+		Value:   "",
+		Path:    "/",
+		Expires: time.Now().Add(-1 * time.Hour),
+	})
+}
+
+// ==================== JWT ====================
 
 func (h *Handler) createJWT(userID int, duration time.Duration) (string, error) {
 	claims := jwt.MapClaims{
@@ -241,8 +178,34 @@ func (h *Handler) createJWT(userID int, duration time.Duration) (string, error) 
 	return token.SignedString(h.JwtSecret)
 }
 
+func (h *Handler) validateJWT(tokenStr string) (int, bool) {
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, http.ErrAbortHandler
+		}
+		return h.JwtSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return 0, false
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return 0, false
+	}
+
+	userIDFloat, ok := claims["user_id"].(float64)
+	if !ok {
+		return 0, false
+	}
+
+	return int(userIDFloat), true
+}
+
 func generateRandomToken() string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	return base64.URLEncoding.EncodeToString(b)
 }
+
+// ==================== Middleware ====================

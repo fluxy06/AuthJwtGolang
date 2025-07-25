@@ -11,34 +11,39 @@ import (
 )
 
 func main() {
+	// Подключение к базе данных
 	db, err := sql.Open("postgres", "postgres://postgres:123@localhost:5432/users?sslmode=disable")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Ошибка подключения к базе данных:", err)
 	}
 	defer db.Close()
 
+	// Проверяем соединение
+	if err := db.Ping(); err != nil {
+		log.Fatal("База данных недоступна:", err)
+	}
+
+	// Создаем обработчики
 	handler := handlers.NewHandler(db)
 
+	// Публичные маршруты
 	http.HandleFunc("/register", handler.Register)
 	http.HandleFunc("/login", handler.Login)
-	http.HandleFunc("/refresh", handler.Refresh)
 	http.HandleFunc("/logout", handler.Logout)
 
-	// Пример защищённого эндпоинта
+	// Пример защищенного маршрута
 	http.Handle("/profile", handler.AuthMiddleware(http.HandlerFunc(profileHandler)))
 
-	log.Println("Server started at :8080")
+	log.Println("Сервер запущен на :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// profileHandler — пример защищённого ресурса, где доступ только при авторизации
+// profileHandler — защищённый эндпоинт
 func profileHandler(w http.ResponseWriter, r *http.Request) {
 	userID, ok := handlers.GetUserIDFromContext(r.Context())
 	if !ok {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-
-	// Здесь можешь, например, получить данные пользователя из БД и вернуть их
-	w.Write([]byte("Your user ID: " + fmt.Sprint(userID)))
+	w.Write([]byte("Ваш user ID: " + fmt.Sprint(userID)))
 }
